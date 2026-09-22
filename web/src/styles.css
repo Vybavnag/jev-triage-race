@@ -1,0 +1,692 @@
+/* Two-channel instrument read.
+   The palette's one hard rule: the two competing channels get hues of equal
+   luminance, so nothing in the UI implies a winner before the data does.
+   That rules out the usual green-good / red-bad dashboard move. Warm amber is
+   reserved for errors, the only state that is genuinely bad.
+   All faces are system stacks — the CSP forbids external hosts, so presence
+   comes from setting and color, not from exotic typefaces. */
+
+:root {
+  color-scheme: dark;
+
+  --bg: #0a0f1c;
+  --bg-grid: rgba(120, 150, 210, 0.055);
+  --surface: #131c31;
+  --surface-2: #18223c;
+  --line: #253150;
+  --line-soft: #1c2740;
+  --text: #e6edfb;
+  --dim: #8e9dbe;
+  --faint: #66739550;
+
+  --jev: #2dd4bf;
+  --jev-deep: #0e9f92;
+  /* Ink for text sitting on the teal button: dark on the bright dark-mode
+     teal, white on the deeper light-mode teal. */
+  --on-jev: #04130f;
+  --jev-wash: rgba(45, 212, 191, 0.14);
+  --llm: #c084fc;
+  --llm-deep: #8b53d6;
+  --llm-wash: rgba(192, 132, 252, 0.14);
+  --warn: #f5a524;
+
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial,
+    sans-serif;
+  --step: 0.5rem;
+  --radius: 3px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --bg: #eef1f4;
+    --bg-grid: rgba(20, 40, 80, 0.04);
+    --surface: #f8fafb;
+    --surface-2: #ffffff;
+    --line: #d3dae1;
+    --line-soft: #e3e8ee;
+    --text: #141a22;
+    --dim: #55606d;
+    --faint: #aab4c2;
+    --jev: #0e7c86;
+    --jev-deep: #0b5f67;
+    --on-jev: #ffffff;
+    --jev-wash: rgba(14, 124, 134, 0.1);
+    --llm: #6d3fc0;
+    --llm-deep: #532f95;
+    --llm-wash: rgba(109, 63, 192, 0.1);
+    --warn: #a8650a;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  color: var(--text);
+  background-color: var(--bg);
+  /* Faint ruled ground: an instrument sits on graph paper, not on a void. */
+  background-image: linear-gradient(var(--bg-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--bg-grid) 1px, transparent 1px);
+  background-size: 100% 32px, 32px 100%;
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Measured values only: tabular so live counters never jitter mid-race. */
+.num {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+.app {
+  max-width: 90rem;
+  margin: 0 auto;
+  padding: calc(var(--step) * 6) calc(var(--step) * 3) calc(var(--step) * 10);
+}
+
+header h1 {
+  font-size: clamp(1.5rem, 1.1rem + 1.6vw, 2.1rem);
+  font-weight: 640;
+  letter-spacing: -0.03em;
+  line-height: 1.15;
+  margin: 0;
+}
+
+header p {
+  margin: calc(var(--step) * 1.5) 0 0;
+  color: var(--dim);
+  max-width: 58ch;
+}
+
+nav {
+  display: flex;
+  gap: calc(var(--step) * 3.5);
+  margin: calc(var(--step) * 5) 0 calc(var(--step) * 4);
+  border-bottom: 1px solid var(--line);
+}
+
+nav button {
+  appearance: none;
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 0 0 calc(var(--step) * 1.5);
+  margin-bottom: -1px;
+  font: inherit;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+nav button:hover {
+  color: var(--text);
+}
+
+nav button[aria-current="true"] {
+  color: var(--text);
+  border-bottom-color: var(--jev);
+}
+
+:is(nav button, button, select, textarea, input, summary, a):focus-visible {
+  outline: 2px solid var(--jev);
+  outline-offset: 2px;
+  border-radius: 1px;
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: calc(var(--step) * 2);
+  align-items: flex-end;
+  margin-bottom: calc(var(--step) * 4);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--step) * 0.75);
+}
+
+.field > span {
+  font-size: 0.82rem;
+  color: var(--dim);
+}
+
+select,
+input[type="number"],
+input[type="password"],
+textarea {
+  font: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: calc(var(--step) * 1) calc(var(--step) * 1.4);
+}
+
+textarea {
+  width: 100%;
+  min-height: 7.5rem;
+  resize: vertical;
+  line-height: 1.55;
+}
+
+.primary {
+  font: inherit;
+  font-weight: 580;
+  color: var(--on-jev);
+  background: linear-gradient(180deg, var(--jev), var(--jev-deep));
+  border: 0;
+  border-radius: var(--radius);
+  padding: calc(var(--step) * 1.1) calc(var(--step) * 3);
+  cursor: pointer;
+}
+
+.primary:hover:not([disabled]) {
+  filter: brightness(1.08);
+}
+
+.primary[disabled] {
+  background: var(--surface-2);
+  color: var(--dim);
+  cursor: not-allowed;
+}
+
+.secondary {
+  font: inherit;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: calc(var(--step) * 1.1) calc(var(--step) * 2.4);
+  cursor: pointer;
+}
+
+.secondary:hover {
+  border-color: var(--dim);
+}
+
+/* ── Hero: two channels racing on a shared axis ─────────────────────────── */
+
+.channel {
+  padding: calc(var(--step) * 3) 0;
+  border-top: 1px solid var(--line-soft);
+}
+
+.channel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--step);
+  margin-bottom: calc(var(--step) * 1.75);
+}
+
+.channel-name {
+  font-weight: 620;
+  font-size: 1.05rem;
+  letter-spacing: -0.015em;
+}
+
+.jev .channel-name {
+  color: var(--jev);
+}
+.llm .channel-name {
+  color: var(--llm);
+}
+
+.channel-name .model {
+  font-weight: 400;
+  color: var(--dim);
+  font-size: 0.85rem;
+  margin-left: calc(var(--step) * 1.5);
+  letter-spacing: 0;
+}
+
+.track {
+  position: relative;
+  height: 2.25rem;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.jev .track {
+  background: linear-gradient(90deg, var(--jev-wash), transparent 70%), var(--surface);
+}
+.llm .track {
+  background: linear-gradient(90deg, var(--llm-wash), transparent 70%), var(--surface);
+}
+
+.track-row {
+  display: flex;
+  height: 100%;
+}
+
+.track-fill {
+  height: 100%;
+  width: 0;
+  transition: width 160ms linear;
+}
+
+.jev .track-fill {
+  background: linear-gradient(90deg, var(--jev-deep), var(--jev));
+  box-shadow: 0 0 20px -2px var(--jev);
+}
+
+.llm .track-fill {
+  background: linear-gradient(90deg, var(--llm-deep), var(--llm));
+  box-shadow: 0 0 20px -2px var(--llm);
+}
+
+.track-errors {
+  height: 100%;
+  background: repeating-linear-gradient(
+    135deg,
+    var(--warn),
+    var(--warn) 3px,
+    transparent 3px,
+    transparent 7px
+  );
+}
+
+.readouts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr));
+  gap: calc(var(--step) * 2) calc(var(--step) * 2.5);
+  margin-top: calc(var(--step) * 2.25);
+}
+
+.readout dt {
+  font-size: 0.76rem;
+  color: var(--dim);
+  margin: 0;
+}
+
+.readout dd {
+  margin: 3px 0 0;
+  font-size: 1.05rem;
+  color: var(--text);
+}
+
+/* The number that visibly ticks during a race gets the size. */
+.readout dd.lead {
+  font-size: 1.5rem;
+  letter-spacing: -0.02em;
+}
+
+.jev .lead {
+  color: var(--jev);
+}
+.llm .lead {
+  color: var(--llm);
+}
+
+.verdict {
+  margin-top: calc(var(--step) * 4);
+  padding: calc(var(--step) * 2.75) calc(var(--step) * 3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: calc(var(--step) * 2.5);
+}
+
+.verdict > div > div {
+  font-size: 0.76rem;
+  color: var(--dim);
+}
+
+.verdict b {
+  display: block;
+  margin-top: 3px;
+  font-size: 1.25rem;
+  font-weight: 620;
+  letter-spacing: -0.02em;
+}
+
+.verdict b.w-jev {
+  color: var(--jev);
+}
+.verdict b.w-llm {
+  color: var(--llm);
+}
+
+.feed {
+  margin-top: calc(var(--step) * 4);
+}
+
+.feed h2,
+section h2 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0 0 calc(var(--step) * 1.5);
+}
+
+.feed ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  max-height: 17rem;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.feed li {
+  display: flex;
+  gap: calc(var(--step) * 1.75);
+  padding: calc(var(--step) * 0.9) calc(var(--step) * 1.75);
+  border-bottom: 1px solid var(--line-soft);
+  white-space: nowrap;
+}
+
+.feed li:last-child {
+  border-bottom: 0;
+}
+
+.tag {
+  font-weight: 620;
+  min-width: 2.4rem;
+}
+.tag.jev {
+  color: var(--jev);
+}
+.tag.llm {
+  color: var(--llm);
+}
+
+.hit {
+  color: var(--text);
+}
+.empty {
+  color: var(--dim);
+}
+/* A struck-out label means the model got that question wrong — reserved for
+   graded results, never for placeholder copy. */
+.miss {
+  color: var(--faint);
+  text-decoration: line-through;
+  text-decoration-color: var(--faint);
+}
+.err {
+  color: var(--warn);
+}
+
+/* ── Playground ─────────────────────────────────────────────────────────── */
+
+.side-by-side {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+  gap: calc(var(--step) * 3);
+  margin-top: calc(var(--step) * 3.5);
+}
+
+.result {
+  border: 1px solid var(--line);
+  border-top-width: 3px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: calc(var(--step) * 3);
+}
+
+.result.jev {
+  border-top-color: var(--jev);
+}
+.result.llm {
+  border-top-color: var(--llm);
+}
+
+.answer {
+  margin: calc(var(--step) * 1.5) 0 0;
+}
+
+.answer dt {
+  font-size: 0.76rem;
+  color: var(--dim);
+}
+
+.answer dd {
+  margin: 3px 0 calc(var(--step) * 2);
+  font-size: 1rem;
+}
+
+/* A probability bar, not a bare number: the distribution is Jev's whole point. */
+.dist {
+  height: 0.45rem;
+  border-radius: 999px;
+  background: var(--line);
+  overflow: hidden;
+  margin-top: 6px;
+  max-width: 22rem;
+}
+
+.dist > span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--jev);
+}
+
+.llm .dist > span {
+  background: var(--llm);
+}
+
+/* A distribution, read as a ranked list of bars. This is the shape only the
+   classifier can return, so it gets room rather than being compressed. */
+.dist-list {
+  margin-top: calc(var(--step) * 1.25);
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--step) * 0.75);
+}
+
+.dist-row {
+  display: grid;
+  grid-template-columns: minmax(6rem, 9rem) 1fr auto;
+  align-items: center;
+  gap: calc(var(--step) * 1.25);
+}
+
+.dist-label {
+  font-size: 0.82rem;
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dist-row .dist {
+  margin-top: 0;
+  max-width: none;
+  height: 0.55rem;
+}
+
+.dist-p {
+  font-size: 0.78rem;
+  color: var(--dim);
+  min-width: 3.1rem;
+  text-align: right;
+}
+
+.answer-value {
+  font-size: 1.05rem;
+}
+
+.answer-note {
+  margin-left: calc(var(--step) * 1.25);
+  font-size: 0.8rem;
+  color: var(--dim);
+}
+
+/* Where a distribution would be, for the side that has none. Kept in the
+   layout on purpose: the empty space is the comparison. */
+.no-dist {
+  margin: calc(var(--step) * 1.25) 0 0;
+  padding-left: calc(var(--step) * 1.5);
+  border-left: 2px solid var(--line);
+  font-size: 0.85rem;
+  color: var(--dim);
+  max-width: 40ch;
+}
+
+/* ── Routing gate ───────────────────────────────────────────────────────── */
+
+.gate {
+  margin-top: calc(var(--step) * 4);
+  padding: calc(var(--step) * 3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.gate-intro {
+  margin: 0 0 calc(var(--step) * 2.5);
+  color: var(--dim);
+  max-width: 62ch;
+}
+
+.gate-slider {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--step) * 2);
+  flex-wrap: wrap;
+  font-size: 0.85rem;
+  color: var(--dim);
+}
+
+.gate-slider input[type="range"] {
+  flex: 1 1 16rem;
+  max-width: 26rem;
+  accent-color: var(--jev);
+}
+
+.gate-threshold {
+  font-size: 1.15rem;
+  color: var(--jev);
+}
+
+.gate-grid {
+  margin-top: calc(var(--step) * 3);
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: calc(var(--step) * 2.5);
+}
+
+.gate-stat > div {
+  font-size: 0.78rem;
+  color: var(--dim);
+}
+
+.gate-stat b {
+  display: block;
+  margin-top: 4px;
+  font-size: 1.85rem;
+  font-weight: 620;
+  letter-spacing: -0.03em;
+  color: var(--jev);
+}
+
+.gate-stat b.gate-wrong {
+  color: var(--warn);
+}
+
+.gate-sub {
+  font-size: 0.78rem;
+  color: var(--dim);
+}
+
+.gate-note {
+  margin: calc(var(--step) * 3) 0 0;
+  padding-top: calc(var(--step) * 2);
+  border-top: 1px solid var(--line-soft);
+  color: var(--dim);
+  font-size: 0.87rem;
+  max-width: 68ch;
+}
+
+details {
+  margin-top: calc(var(--step) * 2.5);
+  border-top: 1px solid var(--line-soft);
+  padding-top: calc(var(--step) * 1.75);
+}
+
+summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--dim);
+}
+
+summary:hover {
+  color: var(--text);
+}
+
+pre {
+  font-family: var(--mono);
+  font-size: 0.74rem;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  padding: calc(var(--step) * 1.75);
+  overflow-x: auto;
+  max-height: 20rem;
+}
+
+.notice {
+  padding: calc(var(--step) * 1.75) calc(var(--step) * 2.25);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--radius);
+  background: var(--surface);
+  margin-bottom: calc(var(--step) * 3);
+}
+
+.prose {
+  max-width: 68ch;
+}
+
+.prose h3 {
+  font-size: 1rem;
+  font-weight: 620;
+  margin: calc(var(--step) * 4) 0 calc(var(--step) * 1);
+  color: var(--jev);
+}
+
+.prose code {
+  font-family: var(--mono);
+  font-size: 0.86em;
+  background: var(--surface);
+  border: 1px solid var(--line-soft);
+  border-radius: 2px;
+  padding: 1px 5px;
+}
+
+footer {
+  margin-top: calc(var(--step) * 9);
+  padding-top: calc(var(--step) * 2.5);
+  border-top: 1px solid var(--line-soft);
+  color: var(--dim);
+  font-size: 0.85rem;
+}
+
+a {
+  color: var(--jev);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .track-fill {
+    transition: none;
+  }
+}

@@ -1,0 +1,25 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Private Claude workspace files
+.claude/
+.remember/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+*.egg-info/
+
+# Node
+web/node_modules/
+web/dist/
+
+# OS / editors
+.DS_Store

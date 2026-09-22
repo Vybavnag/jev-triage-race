@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Run the app locally without Docker: API and UI together, both hot-reloading.
+# Ctrl-C stops both. Open http://localhost:5173
+set -euo pipefail
+cd "$(dirname "$0")"
+
+API_PORT="${API_PORT:-8000}"
+UI_PORT="${UI_PORT:-5173}"
+
+fail() { printf '\n%s\n' "$1" >&2; exit 1; }
+
+[ -f .env ] || fail "No .env found. Copy it first:  cp .env.example .env  then add your keys."
+
+if [ -x .venv/bin/uvicorn ]; then
+  UVICORN=.venv/bin/uvicorn
+elif command -v uvicorn >/dev/null 2>&1; then
+  UVICORN=uvicorn
+else
+  fail "uvicorn not found. Set up the environment first:
+  python3 -m venv .venv && .venv/bin/pip install -e \".[dev]\""
+fi
+
+[ -d web/node_modules ] || fail "Frontend dependencies missing. Run:  cd web && npm install"
+
+for port in "$API_PORT" "$UI_PORT"; do
+  if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+    fail "Port $port is already in use. Stop whatever is on it, or set API_PORT / UI_PORT."
+  fi
+done
+
+pids=()
+cleanup() {
+  trap - INT TERM EXIT
+  [ ${#pids[@]} -gt 0 ] && kill "${pids[@]}" 2>/dev/null || true
+  # uvicorn --reload and vite both spawn workers. Give the parents a moment to
+  # take their children down, then clear anything still holding our ports —
+  # safe because we refused to start unless both were free.
+  for _ in 1 2 3 4 5 6; do
+    sleep 0.5
+    remaining=$(lsof -nP -tiTCP:"$API_PORT" -tiTCP:"$UI_PORT" -sTCP:LISTEN 2>/dev/null || true)
+    [ -z "$remaining" ] && break
+  done
+  remaining=$(lsof -nP -tiTCP:"$API_PORT" -sTCP:LISTEN 2>/dev/null; lsof -nP -tiTCP:"$UI_PORT" -sTCP:LISTEN 2>/dev/null)
+  [ -n "$remaining" ] && kill $remaining 2>/dev/null || true
+  wait 2>/dev/null || true
+  printf '\nStopped.\n'
+}
+trap cleanup INT TERM EXIT
+
+printf 'Starting API on :%s and UI on :%s\n' "$API_PORT" "$UI_PORT"
+
+# Prefix output via process substitution, not a pipe: with `cmd | sed &` the
+# shell records sed's PID, so stopping it would leave the real server running.
+"$UVICORN" app.main:app --reload --port "$API_PORT" > >(sed 's/^/[api] /') 2>&1 &
+pids+=($!)
+
+(cd web && exec npm run dev -- --port "$UI_PORT") > >(sed 's/^/[ui ] /') 2>&1 &
+pids+=($!)
+
+# Wait for the API before announcing the URL, so the first page load has a
+# backend to talk to rather than a proxy error.
+for _ in $(seq 1 40); do
+  if curl -fsS "http://127.0.0.1:$API_PORT/api/health" >/dev/null 2>&1; then
+    printf '\n  Ready: http://localhost:%s   (Ctrl-C stops both)\n\n' "$UI_PORT"
+    break
+  fi
+  sleep 0.5
+done
+
+# If either process dies, bring the whole thing down rather than leaving a
+# half-running stack that fails confusingly in the browser.
+wait -n "${pids[@]}" 2>/dev/null || wait "${pids[0]}" 2>/dev/null || true

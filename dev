@@ -9,7 +9,9 @@ UI_PORT="${UI_PORT:-5173}"
 
 fail() { printf '\n%s\n' "$1" >&2; exit 1; }
 
-[ -f .env ] || fail "No .env found. Copy it first:  cp .env.example .env  then add your keys."
+# Provider keys are entered in the page, so .env is optional: it only holds
+# operator settings such as rate limits.
+[ -f .env ] || printf 'No .env: running with the defaults (copy .env.example to change them).\n'
 
 if [ -x .venv/bin/uvicorn ]; then
   UVICORN=.venv/bin/uvicorn

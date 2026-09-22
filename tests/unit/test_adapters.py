@@ -1,4 +1,6 @@
 import json
+import math
+from types import SimpleNamespace
 
 import anthropic
 import httpx
@@ -6,9 +8,14 @@ import pytest
 import respx
 from typesafe_sdk import (
     ChoiceAnswer,
+    Noul,
     NoulAnswer,
     ScoreAnswer,
     SystemOneResponse,
+    TypeSafeAPITimeoutError,
+    TypeSafeAuthenticationError,
+    TypeSafeError,
+    TypeSafePermissionDeniedError,
     TypeSafeRateLimitError,
     Usage as JevUsage,
 )
@@ -16,7 +23,17 @@ from typesafe_sdk import (
 from app.classifiers.anthropic_llm import AnthropicClassifier, TriageResult
 from app.classifiers.jev import JevClassifier
 from app.classifiers.openai_compat import OpenAICompatClassifier
+from app.review import REVIEW_MAX_TOKENS
 from tests.conftest import SENTINEL_KEY
+
+CODE = "password = 'hunter2'\nresult = eval(user_input)\n"  # noqa: S307 - test data, never executed
+QUESTIONS = ["Is there a hardcoded secret?", "Is there a dangerous call?", "Could this be a function?"]
+
+
+def jev_exc(cls):
+    # SDK exception constructors want a response; __new__ sidesteps that.
+    return cls.__new__(cls)
+
 
 # ── Jev ──────────────────────────────────────────────────────────────────────
 
@@ -70,11 +87,23 @@ def jev_response(
     )
 
 
+def jev_review_response(ps: dict[str, float]) -> SystemOneResponse:
+    return SystemOneResponse(
+        model="jev-1.13.0",
+        usage=JevUsage(input_tokens=900, output_tokens=0),
+        answers={k: NoulAnswer(type="noul", noul=p) for k, p in ps.items()},
+    )
+
+
 class FakeJevClient:
     def __init__(self, result=None, exc=None):
         self.result, self.exc = result, exc
+        self.last_state = None
+        self.last_questions = None
+        self.last_kwargs = None
 
-    async def system_one(self, state, questions):
+    async def system_one(self, state, questions, **kwargs):
+        self.last_state, self.last_questions, self.last_kwargs = state, questions, kwargs
         if self.exc:
             raise self.exc
         return self.result
@@ -139,8 +168,7 @@ async def test_jev_missing_distributions_are_none_not_empty():
 
 
 async def test_jev_rate_limited():
-    exc = TypeSafeRateLimitError.__new__(TypeSafeRateLimitError)
-    v = await make_jev(exc=exc).classify("x")
+    v = await make_jev(exc=jev_exc(TypeSafeRateLimitError)).classify("x")
     assert v.error == "rate_limited"
 
 
@@ -158,28 +186,136 @@ async def test_jev_raw_request_has_no_auth():
     assert v.raw_request["headers"] == {"authorization": "<redacted>"}
 
 
+class TestJevReview:
+    async def test_answers_follow_question_order_even_when_response_keys_do_not(self):
+        c = make_jev(jev_review_response({"q2": 0.3, "q1": 0.8}))
+        v = await c.review(CODE, QUESTIONS[:2])
+        assert v.error is None
+        assert [(a.id, a.p, a.yes) for a in v.answers] == [("q1", 0.8, True), ("q2", 0.3, False)]
+        assert v.usage.input_tokens == 900
+
+    async def test_threshold_is_inclusive(self):
+        v = await make_jev(jev_review_response({"q1": 0.5})).review(CODE, QUESTIONS[:1])
+        assert v.answers[0].yes is True
+
+    async def test_sends_one_noul_per_question_with_the_real_code(self):
+        c = make_jev(jev_review_response({"q1": 0.1, "q2": 0.1, "q3": 0.1}))
+        await c.review(CODE, QUESTIONS)
+        assert c._client.last_state == CODE
+        assert c._client.last_questions == {
+            "q1": Noul(instructions=QUESTIONS[0]),
+            "q2": Noul(instructions=QUESTIONS[1]),
+            "q3": Noul(instructions=QUESTIONS[2]),
+        }
+
+    async def test_timeout_is_passed_only_when_given(self):
+        c = make_jev(jev_review_response({"q1": 0.1}))
+        await c.review(CODE, QUESTIONS[:1])
+        assert "timeout" not in c._client.last_kwargs
+        await c.review(CODE, QUESTIONS[:1], timeout=25.0)
+        assert c._client.last_kwargs["timeout"] == 25.0
+
+    @pytest.mark.parametrize(
+        "ps",
+        [
+            {"q1": 0.9},  # fewer answers than questions
+            {"q1": 0.9, "q2": math.nan},
+            {"q1": 0.9, "q2": 1.5},
+            {"q1": 0.9, "q2": -0.1},
+        ],
+    )
+    async def test_missing_or_out_of_range_answers_are_malformed(self, ps):
+        v = await make_jev(jev_review_response(ps)).review(CODE, QUESTIONS[:2])
+        assert v.error == "malformed"
+
+    async def test_raw_request_omits_the_code_and_raw_response_is_allowlisted(self):
+        v = await make_jev(jev_review_response({"q1": 0.8})).review(CODE, QUESTIONS[:1])
+        req = json.dumps(v.raw_request)
+        assert "hunter2" not in req
+        assert f"<code omitted: {len(CODE)} chars>" in req
+        assert v.raw_request["headers"] == {"authorization": "<redacted>"}
+        assert set(v.raw_response) <= {"model", "answers", "usage"}
+        assert "hunter2" not in json.dumps(v.raw_response)
+
+    @pytest.mark.parametrize("method", ["classify", "review"])
+    @pytest.mark.parametrize(
+        ("exc", "kind"),
+        [
+            (TypeSafeRateLimitError, "rate_limited"),
+            (TypeSafeAPITimeoutError, "timeout"),
+            (TypeSafeAuthenticationError, "invalid_key"),
+            (TypeSafePermissionDeniedError, "invalid_key"),
+            (TypeSafeError, "upstream_error"),
+        ],
+    )
+    async def test_error_mapping_is_shared_by_both_methods(self, method, exc, kind):
+        # A visitor's own key being rejected must read as exactly that, not as
+        # a generic upstream failure they cannot act on.
+        c = make_jev(exc=jev_exc(exc))
+        v = await (c.classify("x") if method == "classify" else c.review(CODE, QUESTIONS[:1]))
+        assert v.error == kind
+
+
 # ── Anthropic ────────────────────────────────────────────────────────────────
 
 
 class FakeAnthropicResp:
-    def __init__(self, stop_reason="end_turn", parsed=None, model="claude-sonnet-5"):
+    """What messages.create returns: content blocks, not a parsed object."""
+
+    def __init__(self, stop_reason="end_turn", parsed=None, text=None, model="claude-sonnet-5"):
         self.stop_reason = stop_reason
-        self.parsed_output = parsed
         self.model = model
-        self.usage = type("U", (), {"input_tokens": 300, "output_tokens": 40})()
+        self.usage = SimpleNamespace(input_tokens=300, output_tokens=40)
+        if text is None and parsed is not None:
+            text = parsed.model_dump_json()
+        self.content = [] if text is None else [SimpleNamespace(type="text", text=text)]
+
+
+class FakeMessages:
+    def __init__(self, resp=None, exc=None):
+        self.resp, self.exc = resp, exc
+        self.calls: list[dict] = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.exc:
+            raise self.exc
+        return self.resp(kwargs) if callable(self.resp) else self.resp
 
 
 def make_anthropic(resp=None, exc=None, model="claude-sonnet-5") -> AnthropicClassifier:
     c = AnthropicClassifier(api_key=SENTINEL_KEY, model=model)
-
-    class FakeMessages:
-        async def parse(self, **kwargs):
-            if exc:
-                raise exc
-            return resp
-
-    c._client = type("FC", (), {"messages": FakeMessages(), "close": None})()
+    c._fake = FakeMessages(resp, exc)
+    c._client = SimpleNamespace(messages=c._fake, close=None)
     return c
+
+
+def answers_from_schema(values: dict[str, bool] | None = None):
+    """Build the JSON the model would return for whatever schema was sent, so
+    a field-name mismatch between adapter and schema fails loudly."""
+
+    def respond(kwargs: dict) -> FakeAnthropicResp:
+        props = kwargs["output_config"]["format"]["schema"]["properties"]
+        body = {name: (values or {}).get(name, i % 2 == 0) for i, name in enumerate(props)}
+        return FakeAnthropicResp(text=json.dumps(body))
+
+    return respond
+
+
+def anthropic_error(status: int) -> anthropic.APIStatusError:
+    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    cls = {
+        429: anthropic.RateLimitError,
+        401: anthropic.AuthenticationError,
+        403: anthropic.PermissionDeniedError,
+    }.get(status, anthropic.APIStatusError)
+    return cls("boom", response=httpx.Response(status, request=req), body=None)
+
+
+def anthropic_timeout() -> anthropic.APITimeoutError:
+    return anthropic.APITimeoutError(
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    )
 
 
 async def test_anthropic_happy_path():
@@ -194,24 +330,64 @@ async def test_anthropic_happy_path():
     assert v.team_confidence is None
 
 
+async def test_anthropic_sends_a_json_schema_output_format():
+    parsed = TriageResult(urgent=True, team="billing", frustration=5)
+    c = make_anthropic(FakeAnthropicResp(parsed=parsed))
+    await c.classify("x")
+    fmt = c._fake.calls[0]["output_config"]["format"]
+    assert fmt["type"] == "json_schema"
+    assert set(fmt["schema"]["required"]) == {"urgent", "team", "frustration"}
+    assert fmt["schema"]["additionalProperties"] is False
+    assert fmt["schema"]["properties"]["team"]["enum"] == ["billing", "technical", "account", "sales"]
+    assert c._fake.calls[0]["output_config"]["effort"] == "low"
+
+
 async def test_anthropic_refusal_is_error_not_label():
     v = await make_anthropic(FakeAnthropicResp(stop_reason="refusal")).classify("x")
     assert v.error == "refusal"
     assert v.team is None
+    # The reason survives so the inspector can show why there is no answer.
+    assert v.raw_response is not None
+    assert v.raw_response["stop_reason"] == "refusal"
+    assert v.raw_response["usage"]["output_tokens"] == 40
 
 
-async def test_anthropic_parsed_none_malformed():
-    v = await make_anthropic(FakeAnthropicResp(parsed=None)).classify("x")
+async def test_anthropic_no_text_block_is_malformed():
+    v = await make_anthropic(FakeAnthropicResp(text=None)).classify("x")
+    assert v.error == "malformed"
+
+
+@pytest.mark.parametrize("method", ["classify", "review"])
+async def test_anthropic_truncated_json_is_malformed_not_a_crash(method):
+    # messages.parse would raise here before stop_reason could be read; the
+    # adapter validates the text itself so a bad body is a verdict, not a 500.
+    c = make_anthropic(FakeAnthropicResp(text='{"urgent": tr'))
+    v = await (c.classify("x") if method == "classify" else c.review(CODE, QUESTIONS[:1]))
+    assert v.error == "malformed"
+
+
+@pytest.mark.parametrize("method", ["classify", "review"])
+async def test_anthropic_max_tokens_stop_is_malformed(method):
+    c = make_anthropic(FakeAnthropicResp(stop_reason="max_tokens", text='{"urgent": true'))
+    v = await (c.classify("x") if method == "classify" else c.review(CODE, QUESTIONS[:1]))
+    assert v.error == "malformed"
+    # A truncation must be diagnosable: the stop reason is the whole story.
+    assert v.raw_response is not None
+    assert v.raw_response["stop_reason"] == "max_tokens"
+    assert "hunter2" not in json.dumps(v.raw_response)
+
+
+async def test_anthropic_out_of_range_frustration_is_malformed():
+    v = await make_anthropic(
+        FakeAnthropicResp(text='{"urgent": true, "team": "billing", "frustration": 9}')
+    ).classify("x")
     assert v.error == "malformed"
 
 
 async def test_anthropic_rate_limit_mapped():
-    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
-    exc = anthropic.RateLimitError(
-        "rate limited", response=httpx.Response(429, request=req), body=None
-    )
-    v = await make_anthropic(exc=exc).classify("x")
+    v = await make_anthropic(exc=anthropic_error(429)).classify("x")
     assert v.error == "rate_limited"
+    assert v.raw_response is None  # nothing came back, so nothing to show
 
 
 async def test_anthropic_effort_only_on_supported_models():
@@ -219,6 +395,81 @@ async def test_anthropic_effort_only_on_supported_models():
     haiku = AnthropicClassifier(api_key="k", model="claude-haiku-4-5")
     assert supported._request_kwargs("t").get("output_config") == {"effort": "low"}
     assert "output_config" not in haiku._request_kwargs("t")
+
+
+class TestAnthropicReview:
+    async def test_happy_path_returns_booleans_without_probabilities(self):
+        c = make_anthropic(answers_from_schema({"q1": True, "q2": False, "q3": True}))
+        v = await c.review(CODE, QUESTIONS)
+        assert v.error is None
+        assert [(a.id, a.p, a.yes) for a in v.answers] == [
+            ("q1", None, True),
+            ("q2", None, False),
+            ("q3", None, True),
+        ]
+        assert v.usage.input_tokens == 300
+
+    async def test_questions_go_in_the_user_turn_and_the_schema_stays_fixed(self):
+        c = make_anthropic(answers_from_schema())
+        await c.review(CODE, QUESTIONS)
+        call = c._fake.calls[0]
+        user = call["messages"][0]["content"]
+        assert "<code>" in user and CODE in user
+        assert f"1. {QUESTIONS[0]}" in user and f"3. {QUESTIONS[2]}" in user
+        assert "data" in call["system"]
+        assert call["max_tokens"] == REVIEW_MAX_TOKENS
+        assert call["output_config"]["effort"] == "low"
+        schema = call["output_config"]["format"]["schema"]
+        assert list(schema["properties"]) == ["q1", "q2", "q3"]
+        assert all("description" not in prop for prop in schema["properties"].values())
+        assert schema["additionalProperties"] is False
+
+    async def test_timeout_is_passed_only_when_given(self):
+        c = make_anthropic(answers_from_schema())
+        await c.review(CODE, QUESTIONS[:1])
+        assert "timeout" not in c._fake.calls[0]
+        await c.review(CODE, QUESTIONS[:1], timeout=25.0)
+        assert c._fake.calls[1]["timeout"] == 25.0
+
+    async def test_refusal(self):
+        v = await make_anthropic(FakeAnthropicResp(stop_reason="refusal")).review(CODE, QUESTIONS)
+        assert v.error == "refusal"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{"q1": true}',  # missing q2
+            '{"q1": true, "q2": false, "q3": true}',  # extra key
+            '{"q1": 1, "q2": false}',  # 1 is not a bool
+        ],
+    )
+    async def test_anything_but_exactly_n_bools_is_malformed(self, text):
+        v = await make_anthropic(FakeAnthropicResp(text=text)).review(CODE, QUESTIONS[:2])
+        assert v.error == "malformed"
+
+    async def test_raw_request_omits_the_code_and_raw_response_is_allowlisted(self):
+        v = await make_anthropic(answers_from_schema()).review(CODE, QUESTIONS[:1])
+        req = json.dumps(v.raw_request)
+        assert "hunter2" not in req
+        assert f"<code omitted: {len(CODE)} chars>" in req
+        assert SENTINEL_KEY not in req
+        assert set(v.raw_response) <= {"model", "stop_reason", "answers", "usage"}
+
+    @pytest.mark.parametrize("method", ["classify", "review"])
+    @pytest.mark.parametrize(
+        ("exc", "kind"),
+        [
+            (anthropic_error(429), "rate_limited"),
+            (anthropic_timeout(), "timeout"),
+            (anthropic_error(401), "invalid_key"),
+            (anthropic_error(403), "invalid_key"),
+            (anthropic_error(500), "upstream_error"),
+        ],
+    )
+    async def test_error_mapping_is_shared_by_both_methods(self, method, exc, kind):
+        c = make_anthropic(exc=exc)
+        v = await (c.classify("x") if method == "classify" else c.review(CODE, QUESTIONS[:1]))
+        assert v.error == kind
 
 
 # ── OpenAI-compatible ────────────────────────────────────────────────────────
@@ -288,10 +539,86 @@ async def test_openai_429_and_timeout():
 
 
 @respx.mock
-async def test_openai_401_body_does_not_leak_key():
+@pytest.mark.parametrize("status", [401, 403])
+async def test_openai_rejected_key_is_invalid_key_and_does_not_leak(status):
     respx.post(f"{BASE}/chat/completions").respond(
-        401, json={"error": f"bad key {SENTINEL_KEY}"}
+        status, json={"error": f"bad key {SENTINEL_KEY}"}
     )
     v = await make_openai().classify("x")
-    assert v.error == "upstream_error"
+    assert v.error == "invalid_key"
     assert SENTINEL_KEY not in json.dumps(v.model_dump(), default=str)
+
+
+class TestOpenAIReview:
+    @respx.mock
+    async def test_happy_path_and_strict_schema(self):
+        route = respx.post(f"{BASE}/chat/completions").respond(
+            200,
+            json=chat_response(
+                json.dumps({"q1": True, "q2": False}),
+                usage={"prompt_tokens": 500, "completion_tokens": 12},
+            ),
+        )
+        v = await make_openai().review(CODE, QUESTIONS[:2])
+        assert v.error is None
+        assert [(a.id, a.p, a.yes) for a in v.answers] == [("q1", None, True), ("q2", None, False)]
+        assert v.usage.input_tokens == 500
+        sent = json.loads(route.calls[0].request.content)
+        fmt = sent["response_format"]["json_schema"]
+        assert fmt["strict"] is True
+        assert fmt["schema"]["required"] == ["q1", "q2"]
+        assert fmt["schema"]["additionalProperties"] is False
+        assert all(p == {"type": "boolean"} for p in fmt["schema"]["properties"].values())
+        user = sent["messages"][1]["content"]
+        assert "<code>" in user and CODE in user and f"1. {QUESTIONS[0]}" in user
+        assert "data" in sent["messages"][0]["content"]
+
+    @respx.mock
+    @pytest.mark.parametrize(
+        "content",
+        ['{"q1": true}', '{"q1": true, "q2": false, "q3": true}', '{"q1": 1, "q2": false}', "nope"],
+    )
+    async def test_anything_but_exactly_n_bools_is_malformed(self, content):
+        respx.post(f"{BASE}/chat/completions").respond(200, json=chat_response(content))
+        v = await make_openai().review(CODE, QUESTIONS[:2])
+        assert v.error == "malformed"
+
+    @respx.mock
+    async def test_raw_request_omits_the_code_and_raw_response_is_allowlisted(self):
+        respx.post(f"{BASE}/chat/completions").respond(
+            200, json=chat_response(json.dumps({"q1": True}))
+        )
+        v = await make_openai().review(CODE, QUESTIONS[:1])
+        req = json.dumps(v.raw_request)
+        assert "hunter2" not in req
+        assert f"<code omitted: {len(CODE)} chars>" in req
+        assert set(v.raw_response) <= {"model", "answers", "usage"}
+
+    @respx.mock
+    async def test_timeout_is_passed_through_to_the_request(self):
+        route = respx.post(f"{BASE}/chat/completions").respond(
+            200, json=chat_response(json.dumps({"q1": True}))
+        )
+        await make_openai().review(CODE, QUESTIONS[:1], timeout=25.0)
+        assert route.called
+
+    @respx.mock
+    @pytest.mark.parametrize("method", ["classify", "review"])
+    @pytest.mark.parametrize(
+        ("status", "side_effect", "kind"),
+        [
+            (429, None, "rate_limited"),
+            (None, httpx.ReadTimeout("boom"), "timeout"),
+            (401, None, "invalid_key"),
+            (500, None, "upstream_error"),
+        ],
+    )
+    async def test_error_mapping_is_shared_by_both_methods(self, method, status, side_effect, kind):
+        route = respx.post(f"{BASE}/chat/completions")
+        if side_effect is not None:
+            route.side_effect = side_effect
+        else:
+            route.respond(status, json={"error": "x"})
+        c = make_openai()
+        v = await (c.classify("x") if method == "classify" else c.review(CODE, QUESTIONS[:1]))
+        assert v.error == kind

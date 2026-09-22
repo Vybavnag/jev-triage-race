@@ -1,4 +1,10 @@
-"""Anthropic Claude adapter — one messages.parse call with a Pydantic schema.
+"""Anthropic Claude adapter — one messages.create with a JSON-schema output.
+
+Why not messages.parse: it validates every text block before the caller can
+read stop_reason, so a refusal with partial text or a max_tokens truncation
+raises instead of reporting. This adapter reads stop_reason first and then
+validates the JSON itself, so both cases are verdicts (`refusal`,
+`malformed`) rather than exceptions.
 
 Fairness notes (also disclosed in the UI):
 - effort is set to "low" on models that support it, thinking stays ENABLED
@@ -10,11 +16,23 @@ Fairness notes (also disclosed in the UI):
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import Literal
+
 import anthropic
 from pydantic import BaseModel, Field
 
 from app.classifiers import base
-from app.schemas import TEAMS, Usage, Verdict
+from app.review import (
+    REVIEW_MAX_TOKENS,
+    SYSTEM_PROMPT as REVIEW_SYSTEM_PROMPT,
+    build_prompt,
+    question_ids,
+    redacted_prompt,
+    review_json_schema,
+    review_model,
+)
+from app.schemas import TEAMS, ReviewAnswer, ReviewVerdict, Usage, Verdict
 
 SYSTEM_PROMPT = (
     "You triage customer support messages. Classify the message exactly per "
@@ -26,11 +44,20 @@ SYSTEM_PROMPT = (
 # Models supporting the effort parameter (Haiku 4.5 rejects it).
 _EFFORT_MODELS = {"claude-opus-5", "claude-sonnet-5"}
 
+TRIAGE_MAX_TOKENS = 512
+
 
 class TriageResult(BaseModel):
     urgent: bool = Field(description="True if the message is urgent/time-sensitive")
-    team: str = Field(description=f"One of: {', '.join(TEAMS)}")
+    team: Literal["billing", "technical", "account", "sales"] = Field(
+        description="The team that should handle the message"
+    )
     frustration: int = Field(ge=1, le=5, description="1 calm .. 5 furious")
+
+
+# The SDK's own transform: additionalProperties false, numeric bounds folded
+# into the description. Pydantic still enforces the bounds on validation.
+TRIAGE_SCHEMA = anthropic.transform_schema(TriageResult)
 
 
 class AnthropicClassifier:
@@ -42,67 +69,114 @@ class AnthropicClassifier:
             api_key=api_key, max_retries=1, timeout=timeout
         )
 
-    def _request_kwargs(self, text: str) -> dict:
+    def _request_kwargs(
+        self, user: str, *, system: str = SYSTEM_PROMPT, max_tokens: int = TRIAGE_MAX_TOKENS
+    ) -> dict:
         kwargs: dict = {
             "model": self._model,
-            "max_tokens": 512,
-            "system": SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": text}],
+            "max_tokens": max_tokens,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
         }
         if self._model in _EFFORT_MODELS:
             kwargs["output_config"] = {"effort": "low"}
         return kwargs
 
-    def _raw_request(self, kwargs: dict) -> dict:
+    def _raw_request(self, kwargs: dict, output_format: str) -> dict:
         return {
             **kwargs,
-            "output_format": "TriageResult(urgent: bool, team: enum, frustration: 1-5)",
+            "output_format": output_format,
             "headers": dict(base.REDACTED_AUTH_HEADERS),
         }
 
-    async def classify(self, text: str) -> Verdict:
-        kwargs = self._request_kwargs(text)
-        raw_request = base.finalize_raw(self._raw_request(kwargs))
+    async def _call(
+        self, kwargs: dict, schema: dict, *, timeout: float | None = None
+    ) -> base.CallResult[str]:
+        """One messages.create. Returns the JSON text for the caller to
+        validate, or an error kind: SDK failures, a refusal, a truncated
+        body, or a response with no text block."""
+        output_config = {
+            **kwargs.get("output_config", {}),
+            "format": {"type": "json_schema", "schema": schema},
+        }
+        request = {**kwargs, "output_config": output_config}
+        if timeout is not None:
+            request["timeout"] = timeout
         with base.Stopwatch() as sw:
             try:
-                resp = await self._client.messages.parse(
-                    output_format=TriageResult, **kwargs
-                )
+                resp = await self._client.messages.create(**request)
             except anthropic.RateLimitError:
-                return Verdict(error=base.RATE_LIMITED, raw_request=raw_request)
+                return base.CallResult(None, base.RATE_LIMITED)
+            except (anthropic.AuthenticationError, anthropic.PermissionDeniedError):
+                return base.CallResult(None, base.INVALID_KEY)
             except (anthropic.APITimeoutError, anthropic.APIConnectionError):
-                return Verdict(error=base.TIMEOUT, raw_request=raw_request)
+                return base.CallResult(None, base.TIMEOUT)
             except anthropic.APIStatusError:
-                return Verdict(error=base.UPSTREAM_ERROR, raw_request=raw_request)
-
+                return base.CallResult(None, base.UPSTREAM_ERROR)
         usage = Usage(
             input_tokens=getattr(resp.usage, "input_tokens", None),
             output_tokens=getattr(resp.usage, "output_tokens", None),
         )
+        meta = {"model": getattr(resp, "model", None), "stop_reason": resp.stop_reason}
         if resp.stop_reason == "refusal":
-            return Verdict(
-                error=base.REFUSAL, usage=usage, latency_ms=sw.ms, raw_request=raw_request
-            )
-        parsed: TriageResult | None = getattr(resp, "parsed_output", None)
-        if parsed is None or parsed.team not in TEAMS:
-            return Verdict(
-                error=base.MALFORMED, usage=usage, latency_ms=sw.ms, raw_request=raw_request
-            )
+            return base.CallResult(None, base.REFUSAL, usage, sw.ms, meta)
+        text = next(
+            (block.text for block in resp.content if getattr(block, "type", None) == "text"),
+            None,
+        )
+        if resp.stop_reason == "max_tokens" or text is None:
+            return base.CallResult(None, base.MALFORMED, usage, sw.ms, meta)
+        return base.CallResult(text, None, usage, sw.ms, meta)
+
+    async def classify(self, text: str) -> Verdict:
+        kwargs = self._request_kwargs(text)
+        raw_request = base.finalize_raw(
+            self._raw_request(kwargs, "TriageResult(urgent: bool, team: enum, frustration: 1-5)")
+        )
+        call = await self._call(kwargs, TRIAGE_SCHEMA)
+        if call.error is not None:
+            return base.failed(Verdict, call, raw_request)
+        parsed = base.validate_json(TriageResult, call.payload)
+        if parsed is None:
+            return base.failed(Verdict, call, raw_request, base.MALFORMED)
         return Verdict(
             urgent_p=1.0 if parsed.urgent else 0.0,
             team=parsed.team,
             frustration_raw=float(parsed.frustration),
             frustration=parsed.frustration,
-            usage=usage,
-            latency_ms=sw.ms,
+            usage=call.usage,
+            latency_ms=call.latency_ms,
             raw_request=raw_request,
             raw_response=base.finalize_raw(
-                {
-                    "model": resp.model,
-                    "stop_reason": resp.stop_reason,
-                    "parsed": parsed.model_dump(),
-                    "usage": usage.model_dump(),
-                }
+                {**call.meta, "parsed": parsed.model_dump(), "usage": call.usage.model_dump()}
+            ),
+        )
+
+    async def review(
+        self, code: str, questions: Sequence[str], *, timeout: float | None = None
+    ) -> ReviewVerdict:
+        n = len(questions)
+        kwargs = self._request_kwargs(
+            build_prompt(code, questions),
+            system=REVIEW_SYSTEM_PROMPT,
+            max_tokens=REVIEW_MAX_TOKENS,
+        )
+        shown = {**kwargs, "messages": [{"role": "user", "content": redacted_prompt(code, questions)}]}
+        raw_request = base.finalize_raw(self._raw_request(shown, f"ReviewResult(q1..q{n}: bool)"))
+        call = await self._call(kwargs, review_json_schema(n), timeout=timeout)
+        if call.error is not None:
+            return base.failed(ReviewVerdict, call, raw_request)
+        parsed = base.validate_json(review_model(n), call.payload)
+        if parsed is None:
+            return base.failed(ReviewVerdict, call, raw_request, base.MALFORMED)
+        answers = [ReviewAnswer(id=qid, p=None, yes=getattr(parsed, qid)) for qid in question_ids(n)]
+        return ReviewVerdict(
+            answers=answers,
+            usage=call.usage,
+            latency_ms=call.latency_ms,
+            raw_request=raw_request,
+            raw_response=base.finalize_raw(
+                {**call.meta, "answers": parsed.model_dump(), "usage": call.usage.model_dump()}
             ),
         )
 

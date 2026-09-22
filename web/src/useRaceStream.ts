@@ -1,6 +1,5 @@
 import { useEffect, useReducer } from "react";
-import type { GateRow } from "./lib/gate";
-import type { RaceEvent, Side, Totals } from "./types";
+import type { RaceEvent, Side, TicketRow, Totals, Winner } from "./types";
 
 /** The race_id is an unguessable capability, so EventSource needs no auth
  * header (which it could not send anyway). */
@@ -13,32 +12,34 @@ export interface SideState {
   lastLatency: number | null;
   costSoFar: number;
   costKnown: boolean;
-  correct: { urgent: number; team: number; frustration: number };
-  scored: number;
-  /** Per-ticket confidence and outcome, kept raw so the routing gate can be
-   * recomputed at any threshold without re-running the race. */
-  gateRows: GateRow[];
 }
 
-export interface FeedRow {
-  side: Side;
-  ticketId: string;
+/** One side's answer for one ticket, as the results table shows it. An
+ * errored call is still an answer row, carrying only its error kind. */
+export interface SideAnswer {
+  urgentP: number | null;
+  team: string | null;
+  teamConfidence: number | null;
+  frustration: number | null;
   latencyMs: number | null;
-  kind: string | null;
-  correct: { urgent: boolean | null; team: boolean | null; frustration: boolean | null } | null;
+  error: string | null;
 }
 
 export interface RaceState {
   status: "idle" | "running" | "done" | "cancelled" | "error";
   total: number;
+  /** False for a run of pasted tickets: no expected labels to show. */
+  labeled: boolean;
+  tickets: TicketRow[];
+  answers: Record<Side, Record<string, SideAnswer>>;
   elapsedMs: number | null;
-  winner: Record<string, string> | null;
+  winner: Winner | null;
   gapped: boolean;
+  /** Why status is "error": the server's kind, or "stream_lost" when the
+   * browser gave up reconnecting (a restart or an expired race). */
+  failure: string | null;
   sides: Record<Side, SideState>;
-  feed: FeedRow[];
 }
-
-const FEED_LIMIT = 30;
 
 const emptySide = (): SideState => ({
   model: "",
@@ -48,24 +49,24 @@ const emptySide = (): SideState => ({
   lastLatency: null,
   costSoFar: 0,
   costKnown: true,
-  correct: { urgent: 0, team: 0, frustration: 0 },
-  scored: 0,
-  gateRows: [],
 });
 
 export const initialState = (): RaceState => ({
   status: "idle",
   total: 0,
+  labeled: true,
+  tickets: [],
+  answers: { jev: {}, llm: {} },
   elapsedMs: null,
   winner: null,
   gapped: false,
+  failure: null,
   sides: { jev: emptySide(), llm: emptySide() },
-  feed: [],
 });
 
-type Action = { type: "reset"; total: number } | { type: "event"; event: RaceEvent };
+export type Action = { type: "reset"; total: number } | { type: "event"; event: RaceEvent };
 
-function reducer(state: RaceState, action: Action): RaceState {
+export function reducer(state: RaceState, action: Action): RaceState {
   if (action.type === "reset") {
     return { ...initialState(), status: "running", total: action.total };
   }
@@ -77,6 +78,8 @@ function reducer(state: RaceState, action: Action): RaceState {
         ...state,
         status: "running",
         total: data.total,
+        labeled: data.labeled ?? true,
+        tickets: data.tickets ?? [],
         sides: {
           jev: { ...state.sides.jev, model: data.sides?.jev ?? "" },
           llm: { ...state.sides.llm, model: data.sides?.llm ?? "" },
@@ -84,58 +87,47 @@ function reducer(state: RaceState, action: Action): RaceState {
       };
 
     case "result": {
-      const side = state.sides[data.side as Side];
-      const c = data.correct ?? {};
+      const side = data.side as Side;
+      const s = state.sides[side];
+      const answer: SideAnswer = {
+        urgentP: data.verdict?.urgent_p ?? null,
+        team: data.verdict?.team ?? null,
+        teamConfidence: data.verdict?.team_confidence ?? null,
+        frustration: data.verdict?.frustration ?? null,
+        latencyMs: data.latency_ms ?? null,
+        error: null,
+      };
       return {
         ...state,
+        answers: { ...state.answers, [side]: { ...state.answers[side], [data.ticket_id]: answer } },
         sides: {
           ...state.sides,
-          [data.side]: {
-            ...side,
-            done: side.done + 1,
-            scored: side.scored + 1,
+          [side]: {
+            ...s,
+            done: s.done + 1,
             lastLatency: data.latency_ms,
-            costSoFar: side.costSoFar + (data.cost_usd ?? 0),
-            costKnown: side.costKnown && data.cost_usd !== null,
-            correct: {
-              urgent: side.correct.urgent + (c.urgent ? 1 : 0),
-              team: side.correct.team + (c.team ? 1 : 0),
-              frustration: side.correct.frustration + (c.frustration ? 1 : 0),
-            },
-            gateRows: [
-              ...side.gateRows,
-              {
-                confidence: data.verdict?.team_confidence ?? null,
-                teamCorrect: Boolean(c.team),
-              },
-            ],
+            costSoFar: s.costSoFar + (data.cost_usd ?? 0),
+            costKnown: s.costKnown && data.cost_usd !== null,
           },
         },
-        feed: [
-          {
-            side: data.side,
-            ticketId: data.ticket_id,
-            latencyMs: data.latency_ms,
-            kind: null,
-            correct: data.correct,
-          },
-          ...state.feed,
-        ].slice(0, FEED_LIMIT),
       };
     }
 
     case "error": {
-      const side = state.sides[data.side as Side];
+      const side = data.side as Side;
+      const s = state.sides[side];
+      const answer: SideAnswer = {
+        urgentP: null,
+        team: null,
+        teamConfidence: null,
+        frustration: null,
+        latencyMs: null,
+        error: data.kind,
+      };
       return {
         ...state,
-        sides: {
-          ...state.sides,
-          [data.side]: { ...side, done: side.done + 1, errors: side.errors + 1 },
-        },
-        feed: [
-          { side: data.side, ticketId: data.ticket_id, latencyMs: null, kind: data.kind, correct: null },
-          ...state.feed,
-        ].slice(0, FEED_LIMIT),
+        answers: { ...state.answers, [side]: { ...state.answers[side], [data.ticket_id]: answer } },
+        sides: { ...state.sides, [side]: { ...s, done: s.done + 1, errors: s.errors + 1 } },
       };
     }
 
@@ -149,13 +141,13 @@ function reducer(state: RaceState, action: Action): RaceState {
       };
 
     case "race_done":
-      return { ...state, status: "done", elapsedMs: data.elapsed_ms, winner: data.winner };
+      return { ...state, status: "done", elapsedMs: data.elapsed_ms, winner: data.winner ?? null };
 
     case "cancelled":
       return { ...state, status: "cancelled" };
 
     case "race_error":
-      return { ...state, status: "error" };
+      return { ...state, status: "error", failure: data.error ?? "internal_error" };
 
     case "gap":
       return { ...state, gapped: true };
@@ -190,6 +182,17 @@ export function useRaceStream(raceId: string | null) {
       source.addEventListener(kind, handler as EventListener);
       return [kind, handler] as const;
     });
+    // EventSource retries transient drops on its own. A permanent failure (a
+    // 404 after a restart or an expired race) closes it for good, and no
+    // terminal event will ever arrive: say so instead of staying "running".
+    source.onerror = () => {
+      if (source.readyState === EventSource.CLOSED) {
+        dispatch({
+          type: "event",
+          event: { event: "race_error", data: { error: "stream_lost" } },
+        });
+      }
+    };
 
     return () => {
       handlers.forEach(([kind, handler]) =>

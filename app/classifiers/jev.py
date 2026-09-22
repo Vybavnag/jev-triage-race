@@ -1,20 +1,40 @@
-"""Jev (TypeSafe AI) adapter — one system_one call, three questions."""
+"""Jev (TypeSafe AI) adapter — one system_one call answers every question.
+
+Triage asks three fixed questions (a Noul, a Choice, a Score). Review asks
+one Noul per user question, so what comes back is a probability per
+question rather than a bare yes/no.
+"""
 
 from __future__ import annotations
+
+import math
+from collections.abc import Mapping, Sequence
 
 from typesafe_sdk import (
     AsyncTypeSafeClient,
     Choice,
     Noul,
+    Question,
     RetryPolicy,
     Score,
+    SystemOneResponse,
     TypeSafeAPITimeoutError,
+    TypeSafeAuthenticationError,
     TypeSafeError,
+    TypeSafePermissionDeniedError,
     TypeSafeRateLimitError,
 )
 
 from app.classifiers import base
-from app.schemas import TEAMS, FrustrationLevel, TeamOption, Usage, Verdict
+from app.review import code_placeholder, question_ids, yes_from_p
+from app.schemas import (
+    FrustrationLevel,
+    ReviewAnswer,
+    ReviewVerdict,
+    TeamOption,
+    Usage,
+    Verdict,
+)
 from app.scoring import map_score_to_level
 
 # Score criteria are an ordered list of level descriptions; the answer is a
@@ -78,6 +98,17 @@ def _frustration_distribution(
     ]
 
 
+def _probability(value: object) -> float:
+    """A Noul answer must be a real number in [0, 1]; anything else is a
+    malformed response, not a probability to act on."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("not a number")
+    p = float(value)
+    if math.isnan(p) or not 0.0 <= p <= 1.0:
+        raise ValueError("out of range")
+    return p
+
+
 class JevClassifier:
     name = "jev"
 
@@ -90,30 +121,51 @@ class JevClassifier:
             timeout=timeout,
         )
 
-    def _raw_request(self, text: str) -> dict:
+    def _raw_request(self, state: str, questions: Mapping[str, Question]) -> dict:
         # Built from typed fields BEFORE auth is attached — never from a
         # captured HTTP request, so no header can leak.
         return {
             "model": self._model,
-            "state": text,
-            "questions": {k: q.model_dump() for k, q in QUESTIONS.items()},
+            "state": state,
+            "questions": {k: q.model_dump() for k, q in questions.items()},
             "headers": dict(base.REDACTED_AUTH_HEADERS),
         }
 
-    async def classify(self, text: str) -> Verdict:
-        raw_request = self._raw_request(text)
+    async def _call(
+        self,
+        state: str,
+        questions: Mapping[str, Question],
+        *,
+        timeout: float | None = None,
+    ) -> base.CallResult[SystemOneResponse]:
+        options = {"timeout": timeout} if timeout is not None else {}
         with base.Stopwatch() as sw:
             try:
-                resp = await self._client.system_one(text, QUESTIONS)
+                resp = await self._client.system_one(state, questions, **options)
             except TypeSafeRateLimitError:
-                return Verdict(error=base.RATE_LIMITED, raw_request=base.finalize_raw(raw_request))
+                return base.CallResult(None, base.RATE_LIMITED)
             except TypeSafeAPITimeoutError:
-                return Verdict(error=base.TIMEOUT, raw_request=base.finalize_raw(raw_request))
+                return base.CallResult(None, base.TIMEOUT)
+            except (TypeSafeAuthenticationError, TypeSafePermissionDeniedError):
+                return base.CallResult(None, base.INVALID_KEY)
             except TypeSafeError:
-                return Verdict(error=base.UPSTREAM_ERROR, raw_request=base.finalize_raw(raw_request))
+                return base.CallResult(None, base.UPSTREAM_ERROR)
+        reported = getattr(resp, "usage", None)
+        usage = Usage(
+            input_tokens=getattr(reported, "input_tokens", None),
+            output_tokens=getattr(reported, "output_tokens", None),
+        )
+        return base.CallResult(resp, None, usage, sw.ms, {"model": getattr(resp, "model", None)})
+
+    async def classify(self, text: str) -> Verdict:
+        raw_request = base.finalize_raw(self._raw_request(text, QUESTIONS))
+        call = await self._call(text, QUESTIONS)
+        if call.error is not None:
+            return base.failed(Verdict, call, raw_request)
+        resp = call.payload
         # Only the upstream-shape reads are guarded: a failure here means Jev
-        # returned something unexpected. Verdict/blob construction stays
-        # outside so an internal bug can never masquerade as "malformed".
+        # returned something unexpected. Verdict construction stays outside so
+        # an internal bug can never masquerade as "malformed".
         try:
             answers = resp.answers
             urgent_p = answers["is_urgent"].noul
@@ -125,16 +177,8 @@ class JevClassifier:
             frustration_distribution = _frustration_distribution(
                 frustration_ans.probabilities, frustration_ans.legend
             )
-            usage = Usage(
-                input_tokens=resp.usage.input_tokens if resp.usage else None,
-                output_tokens=resp.usage.output_tokens if resp.usage else None,
-            )
         except (KeyError, AttributeError, TypeError):
-            return Verdict(
-                error=base.MALFORMED,
-                latency_ms=sw.ms,
-                raw_request=base.finalize_raw(raw_request),
-            )
+            return base.failed(Verdict, call, raw_request, base.MALFORMED)
 
         return Verdict(
             urgent_p=urgent_p,
@@ -144,10 +188,42 @@ class JevClassifier:
             frustration_distribution=frustration_distribution,
             frustration_raw=score,
             frustration=map_score_to_level(score),
-            usage=usage,
-            latency_ms=sw.ms,
-            raw_request=base.finalize_raw(raw_request),
+            usage=call.usage,
+            latency_ms=call.latency_ms,
+            raw_request=raw_request,
             raw_response=base.finalize_raw(resp.model_dump()),
+        )
+
+    async def review(
+        self, code: str, questions: Sequence[str], *, timeout: float | None = None
+    ) -> ReviewVerdict:
+        ids = question_ids(len(questions))
+        asked = {qid: Noul(instructions=q) for qid, q in zip(ids, questions, strict=True)}
+        raw_request = base.finalize_raw(self._raw_request(code_placeholder(code), asked))
+        call = await self._call(code, asked, timeout=timeout)
+        if call.error is not None:
+            return base.failed(ReviewVerdict, call, raw_request)
+        try:
+            answers = [
+                ReviewAnswer(id=qid, p=p, yes=yes_from_p(p))
+                for qid in ids
+                for p in (_probability(call.payload.answers[qid].noul),)
+            ]
+        except (KeyError, AttributeError, TypeError, ValueError):
+            return base.failed(ReviewVerdict, call, raw_request, base.MALFORMED)
+        return ReviewVerdict(
+            answers=answers,
+            usage=call.usage,
+            latency_ms=call.latency_ms,
+            raw_request=raw_request,
+            # Allowlisted: the answers, never the echoed state.
+            raw_response=base.finalize_raw(
+                {
+                    **call.meta,
+                    "answers": {a.id: {"noul": a.p} for a in answers},
+                    "usage": call.usage.model_dump(),
+                }
+            ),
         )
 
     async def close(self) -> None:

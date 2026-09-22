@@ -1,12 +1,31 @@
 import asyncio
+import json
 
 import pytest
 
 from app.race import BUFFER_MAX_BYTES, RaceManager, RaceRun
+from app.schemas import RaceItem
 from tests.conftest import FakeClassifier, flat_cost
 
+MARKER = "UNIQUE-PASTED-MARKER"
 
-async def start_simple(manager: RaceManager, tickets, jev=None, llm=None, conc=None):
+
+def own_tickets(n: int) -> list[RaceItem]:
+    """Pasted, unlabeled tickets as the race router builds them."""
+    return [RaceItem(id=f"p{i}", text=f"pasted ticket {i} {MARKER}") for i in range(1, n + 1)]
+
+
+class Closable:
+    """Stands in for one run's provider clients."""
+
+    def __init__(self):
+        self.closed = 0
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+async def start_simple(manager: RaceManager, tickets, jev=None, llm=None, conc=None, providers=None):
     jev = jev or FakeClassifier("jev")
     llm = llm or FakeClassifier("llm")
     run = await manager.start(
@@ -16,8 +35,41 @@ async def start_simple(manager: RaceManager, tickets, jev=None, llm=None, conc=N
         concurrency=conc or {"jev": 8, "llm": 4},
         per_ticket_timeout=5.0,
         sides_meta={"jev": "jev-latest", "llm": "fake-llm"},
+        providers=providers,
     )
     return run, jev, llm
+
+
+class TestProviderLifetime:
+    """The clients behind a run are built from the visitor's keys for that
+    run alone, so the run must close them exactly once however it ends."""
+
+    async def test_closed_once_when_the_race_finishes(self, tickets5):
+        m = RaceManager()
+        providers = Closable()
+        run, _, _ = await start_simple(m, tickets5, providers=providers)
+        await wait_done(run)
+        assert providers.closed == 1
+        await m.cancel(run.id)  # a late cancel must not close them again
+        assert providers.closed == 1
+
+    async def test_closed_once_when_cancelled_mid_race(self, tickets5):
+        m = RaceManager()
+        providers = Closable()
+        gate = asyncio.Event()
+        run, _, _ = await start_simple(m, tickets5, llm=FakeClassifier("llm", gate=gate), providers=providers)
+        await asyncio.sleep(0.02)
+        await m.cancel(run.id)
+        assert providers.closed == 1
+
+    async def test_closed_when_cancelled_before_the_task_ran(self, tickets5):
+        m = RaceManager()
+        providers = Closable()
+        run, _, _ = await start_simple(
+            m, tickets5, llm=FakeClassifier("llm", gate=asyncio.Event()), providers=providers
+        )
+        await m.cancel(run.id)
+        assert providers.closed == 1
 
 
 async def wait_done(run: RaceRun):
@@ -39,7 +91,59 @@ async def test_race_completes_and_publishes_summary(tickets5):
     assert sum(1 for k in kinds if k in ("result", "error")) == 10
     final = events[-1][2]
     assert final["totals"]["jev"]["attempted"] == 5
-    assert final["winner"] is not None
+    assert set(final["winner"]) == {"speed", "cost"}  # measured, never judged
+    start = events[0][2]
+    assert start["labeled"] is True
+    # Bundled tickets travel with their text and expected labels, so the UI
+    # can put each answer next to what the label says.
+    assert [t["id"] for t in start["tickets"]] == [t.id for t in tickets5]
+    assert start["tickets"][0]["text"] == tickets5[0].text
+    assert start["tickets"][0]["expected"] == {"urgent": True, "team": "technical", "frustration": 4}
+    results = [e[2] for e in events if e[1] == "result"]
+    assert all("correct" not in r for r in results)
+
+
+class TestOwnTickets:
+    async def test_own_tickets_carry_no_text_and_no_expected_answer(self):
+        m = RaceManager()
+        run, _, _ = await start_simple(m, own_tickets(3))
+        await wait_done(run)
+        assert run.status == "done"
+        start = run._buffer[0][2]
+        assert start["labeled"] is False
+        assert start["tickets"] == [
+            {"id": "p1", "text": None, "expected": None},
+            {"id": "p2", "text": None, "expected": None},
+            {"id": "p3", "text": None, "expected": None},
+        ]
+        results = [e[2] for e in run._buffer if e[1] == "result"]
+        assert len(results) == 6
+        assert {r["ticket_id"] for r in results} == {"p1", "p2", "p3"}
+        assert run._buffer[-1][2]["winner"] == {"speed": "tie", "cost": "tie"}
+
+    async def test_cancelled_payload_carries_totals(self):
+        m = RaceManager()
+        gate = asyncio.Event()
+        run, _, _ = await start_simple(m, own_tickets(2), llm=FakeClassifier("llm", gate=gate))
+        await asyncio.sleep(0.02)
+        assert await m.cancel(run.id) is True
+        seq, event, data = run._buffer[-1]
+        assert event == "cancelled"
+        assert data["totals"]["jev"]["attempted"] == 2
+
+    async def test_cancel_before_the_task_runs_still_terminates(self):
+        m = RaceManager()
+        run, _, _ = await start_simple(m, own_tickets(2), llm=FakeClassifier("llm", gate=asyncio.Event()))
+        await m.cancel(run.id)  # no await in between: the task may never have started
+        seq, event, data = run._buffer[-1]
+        assert event == "cancelled"
+        assert "totals" in data
+
+    async def test_frames_never_contain_pasted_text(self):
+        m = RaceManager()
+        run, _, _ = await start_simple(m, own_tickets(2))
+        await wait_done(run)
+        assert MARKER not in json.dumps([e[2] for e in run._buffer], default=str)
 
 
 async def test_partial_failure_does_not_abort(tickets5):

@@ -6,84 +6,54 @@ Jev. Per-ticket wall clock is bounded by asyncio.timeout; per-attempt HTTP
 timeouts (12s) and max_retries=1 live in the adapters so a retry is never
 severed mid-flight.
 
-Events flow into a per-run ring buffer (byte-bounded, monotonic seq used as
-the SSE id) and fan out to live subscriber queues. Reconnects replay from
-the buffer; if the requested position was evicted, an explicit `gap` event
-is emitted rather than silently skipping.
+Events go through the shared per-run buffer in app.streaming. Nothing here
+judges an answer: bundled tickets travel with their expected labels in the
+`start` event so the UI can show each answer beside what the label says, and
+the person decides. Pasted tickets carry no labels and are never echoed.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import secrets
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Callable
 
-from app.schemas import Correct, Ticket, Usage, Verdict
-from app.scoring import SideTally, grade, winner
-from app.security import scrub
-
-BUFFER_MAX_BYTES = 256 * 1024
-RUN_TTL_SECONDS = 15 * 60
-QUEUE_MAX = 1024
+from app.schemas import RaceItem, Ticket, Usage, Verdict
+from app.scoring import SideTally, winner
+from app.streaming import BUFFER_MAX_BYTES, EventRun, purge_expired  # noqa: F401 - re-exported
 
 CostFn = Callable[[Usage], float | None]
 
 
-@dataclass
-class RaceRun:
-    id: str
+def ticket_view(item: RaceItem) -> dict:
+    """What the client learns about a ticket before any answer arrives. A
+    bundled ticket brings its text and expected labels; a pasted one is an
+    id only, because the client already holds its own text and frames must
+    never echo it."""
+    if isinstance(item, Ticket):
+        return {
+            "id": item.id,
+            "text": item.text,
+            "expected": {"urgent": item.urgent, "team": item.team, "frustration": item.frustration},
+        }
+    return {"id": item.id, "text": None, "expected": None}
+
+
+@dataclass(kw_only=True)
+class RaceRun(EventRun):
     total: int
     sides: dict[str, str]  # side -> provider label (e.g. {"jev": "jev-latest", "llm": "claude-sonnet-5"})
-    status: str = "running"  # running | done | cancelled | error
-    created: float = field(default_factory=time.monotonic)
-    finished_at: float | None = None
-    task: asyncio.Task | None = None
+    labeled: bool = True
     tallies: dict[str, SideTally] = field(default_factory=dict)
-    _seq: int = 0
-    _buffer: list[tuple[int, str, dict]] = field(default_factory=list)  # (seq, event, data)
-    _buffer_bytes: int = 0
-    floor_seq: int = 0  # oldest seq still in buffer
-    _subscribers: list[asyncio.Queue] = field(default_factory=list)
+    # The provider clients built from the visitor's keys for this run alone;
+    # closed exactly once when the run ends, however it ends.
+    providers: object | None = None
 
-    def publish(self, event: str, data: dict) -> None:
-        self._seq += 1
-        data = scrub(data)
-        entry = (self._seq, event, data)
-        size = len(json.dumps(data, default=str).encode()) + len(event)
-        self._buffer.append(entry)
-        self._buffer_bytes += size
-        while self._buffer and self._buffer_bytes > BUFFER_MAX_BYTES:
-            old_seq, old_event, old_data = self._buffer.pop(0)
-            self._buffer_bytes -= (
-                len(json.dumps(old_data, default=str).encode()) + len(old_event)
-            )
-            self.floor_seq = old_seq
-        for q in list(self._subscribers):
-            try:
-                q.put_nowait(entry)
-            except asyncio.QueueFull:
-                pass  # slow consumer: it will resync via Last-Event-ID replay
-
-    def subscribe(self) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAX)
-        self._subscribers.append(q)
-        return q
-
-    def unsubscribe(self, q: asyncio.Queue) -> None:
-        if q in self._subscribers:
-            self._subscribers.remove(q)
-
-    def replay_from(self, last_id: int) -> tuple[bool, list[tuple[int, str, dict]]]:
-        """Events after last_id. Returns (gapped, events)."""
-        gapped = last_id < self.floor_seq
-        return gapped, [e for e in self._buffer if e[0] > last_id]
-
-    @property
-    def is_finished(self) -> bool:
-        return self.status in ("done", "cancelled", "error")
+    def terminal_payload(self) -> dict:
+        """What every terminal event carries: per-side totals."""
+        return {"totals": {s: t.summary() for s, t in self.tallies.items()}}
 
 
 class RaceManager:
@@ -97,15 +67,8 @@ class RaceManager:
         self._active_race_id: str | None = None
 
     def get(self, race_id: str) -> RaceRun | None:
-        self._purge_expired()
+        purge_expired(self._runs)
         return self._runs.get(race_id)
-
-    def _purge_expired(self) -> None:
-        now = time.monotonic()
-        for rid in list(self._runs):
-            run = self._runs[rid]
-            if run.is_finished and run.finished_at and now - run.finished_at > RUN_TTL_SECONDS:
-                del self._runs[rid]
 
     @property
     def race_in_progress(self) -> bool:
@@ -113,22 +76,25 @@ class RaceManager:
 
     async def start(
         self,
-        tickets: list[Ticket],
+        tickets: Sequence[RaceItem],
         classifiers: dict[str, object],  # side -> Classifier
         cost_fns: dict[str, CostFn],
         concurrency: dict[str, int],
         per_ticket_timeout: float,
         sides_meta: dict[str, str],
+        providers: object | None = None,
     ) -> RaceRun | None:
         """Returns the new run, or None if a race is already in progress."""
-        self._purge_expired()
+        purge_expired(self._runs)
         if self._active_race_id is not None:
             return None
         run = RaceRun(
             id=secrets.token_urlsafe(16),
             total=len(tickets),
             sides=sides_meta,
+            labeled=all(isinstance(t, Ticket) for t in tickets),
             tallies={side: SideTally() for side in classifiers},
+            providers=providers,
         )
         # Claimed before the first await, so a second caller in this same tick
         # is refused rather than queued behind us.
@@ -145,11 +111,17 @@ class RaceManager:
         never reaches its own finally block."""
         if status and run.status == "running":
             run.status = status
-            run.publish(status, {"totals": {s: t.summary() for s, t in run.tallies.items()}})
+            run.publish(status, run.terminal_payload())
         if run.finished_at is None:
             run.finished_at = time.monotonic()
         if self._active_race_id == run.id:
             self._active_race_id = None
+
+    @staticmethod
+    async def _close_providers(run: RaceRun) -> None:
+        providers, run.providers = run.providers, None  # once, whoever gets here first
+        if providers is not None:
+            await providers.close()
 
     async def cancel(self, race_id: str) -> bool:
         run = self.get(race_id)
@@ -165,12 +137,13 @@ class RaceManager:
         # finally never fired, so the slot would leak and the stream would
         # never see a terminal event.
         self._release(run, status="cancelled")
+        await self._close_providers(run)
         return True
 
     async def _run_race(
         self,
         run: RaceRun,
-        tickets: list[Ticket],
+        tickets: Sequence[RaceItem],
         classifiers: dict[str, object],
         cost_fns: dict[str, CostFn],
         concurrency: dict[str, int],
@@ -178,7 +151,16 @@ class RaceManager:
     ) -> None:
         try:
             started = time.perf_counter()
-            run.publish("start", {"race_id": run.id, "total": run.total, "sides": run.sides})
+            run.publish(
+                "start",
+                {
+                    "race_id": run.id,
+                    "total": run.total,
+                    "sides": run.sides,
+                    "labeled": run.labeled,
+                    "tickets": [ticket_view(t) for t in tickets],
+                },
+            )
             try:
                 async with asyncio.TaskGroup() as tg:
                     for side, classifier in classifiers.items():
@@ -198,7 +180,7 @@ class RaceManager:
                     "race_done",
                     {
                         "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
-                        "totals": {s: t.summary() for s, t in run.tallies.items()},
+                        **run.terminal_payload(),
                         "winner": winner(run.tallies["jev"], run.tallies["llm"])
                         if {"jev", "llm"} <= run.tallies.keys()
                         else None,
@@ -206,7 +188,7 @@ class RaceManager:
                 )
             except asyncio.CancelledError:
                 run.status = "cancelled"
-                run.publish("cancelled", {"totals": {s: t.summary() for s, t in run.tallies.items()}})
+                run.publish("cancelled", run.terminal_payload())
                 raise
             except Exception:
                 run.status = "error"
@@ -215,13 +197,14 @@ class RaceManager:
             # Always release the slot, including on cancellation, or the app
             # would refuse every later race until it restarts.
             self._release(run)
+            await self._close_providers(run)
 
     async def _run_side(
         self,
         run: RaceRun,
         side: str,
         classifier,
-        tickets: list[Ticket],
+        tickets: Sequence[RaceItem],
         cost_fn: CostFn,
         limit: int,
         per_ticket_timeout: float,
@@ -229,7 +212,7 @@ class RaceManager:
         sem = asyncio.Semaphore(limit)
         tally = run.tallies[side]
 
-        async def one(index: int, ticket: Ticket) -> None:
+        async def one(index: int, ticket: RaceItem) -> None:
             async with sem:
                 try:
                     async with asyncio.timeout(per_ticket_timeout):
@@ -240,35 +223,33 @@ class RaceManager:
                     raise
                 except Exception:
                     verdict = Verdict(error="upstream_error")
-            correct = grade(ticket, verdict)
             cost = cost_fn(verdict.usage) if verdict.error is None else None
-            tally.add(correct, verdict, cost)
+            tally.add(verdict, cost)
             if verdict.error is not None:
                 run.publish(
                     "error",
                     {"side": side, "index": index, "ticket_id": ticket.id, "kind": verdict.error},
                 )
-            else:
-                run.publish(
-                    "result",
-                    {
-                        "side": side,
-                        "index": index,
-                        "ticket_id": ticket.id,
-                        "latency_ms": round(verdict.latency_ms, 1),
-                        "verdict": {
-                            "urgent_p": verdict.urgent_p,
-                            "team": verdict.team,
-                            "frustration": verdict.frustration,
-                            # Null for the LLM: it has no confidence to gate
-                            # on, which is what the routing panel shows.
-                            "team_confidence": verdict.team_confidence,
-                        },
-                        "correct": correct.model_dump(),
-                        "usage": verdict.usage.model_dump(),
-                        "cost_usd": cost,
+                return
+            run.publish(
+                "result",
+                {
+                    "side": side,
+                    "index": index,
+                    "ticket_id": ticket.id,
+                    "latency_ms": round(verdict.latency_ms, 1),
+                    "verdict": {
+                        "urgent_p": verdict.urgent_p,
+                        "team": verdict.team,
+                        "frustration": verdict.frustration,
+                        # Null for the LLM: it asserts a team with nothing
+                        # to say how close the call was.
+                        "team_confidence": verdict.team_confidence,
                     },
-                )
+                    "usage": verdict.usage.model_dump(),
+                    "cost_usd": cost,
+                },
+            )
 
         async with asyncio.TaskGroup() as tg:
             for i, ticket in enumerate(tickets):

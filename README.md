@@ -1,4 +1,5 @@
 # Jev vs LLM: triage race
+Created by Claude code
 
 Race a **classifier** against a **language model** on the same job, and watch
 speed, cost, and accuracy diverge in real time.
@@ -213,7 +214,3 @@ passes through platform proxies without upgrade handling.
 
 Race state lives in memory. Restarting the process loses history, which is
 fine for a demo and deliberate — there is no database to run.
-
-## License
-
-MIT.
